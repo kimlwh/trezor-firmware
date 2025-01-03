@@ -22,95 +22,58 @@
 
 #include <io/i2c_bus.h>
 #include <sys/irq.h>
+#include <sys/systick.h>
 #include <sys/systimer.h>
 
 #include "stwlc38.h"
 #include "stwlc38_defs.h"
+#include "stwlc38_internal.h"
 
 #ifdef KERNEL_MODE
 
-// !@# TODO: put following constants the board file
-#define STWLC38_INT_PIN GPIO_PIN_15
-#define STWLC38_INT_PORT GPIOG
-#define STWLC38_INT_PIN_CLK_ENA __HAL_RCC_GPIOG_CLK_ENABLE
-#define STWLC38_EXTI_INTERRUPT_GPIOSEL EXTI_GPIOG
-#define STWLC38_EXTI_INTERRUPT_LINE EXTI_LINE_15
-#define STWLC38_EXTI_INTERRUPT_NUM EXTI15_IRQn
-#define STWLC38_EXTI_INTERRUPT_HANDLER EXTI15_IRQHandler
-#define STWLC38_ENB_PIN GPIO_PIN_3
-#define STWLC37_ENB_PORT GPIOD
-#define STWLC38_ENB_PIN_CLK_ENA __HAL_RCC_GPIOD_CLK_ENABLE
-
-// Period of the report readout [ms]
-#define STWLC38_REPORT_READOUT_INTERVAL_MS 500
-
-// STWLC38 FSM states
-typedef enum {
-  STWLC38_STATE_POWER_DOWN = 0,
-  STWLC38_STATE_IDLE,
-  STWLC38_STATE_VOUT_ENABLE,
-  STWLC38_STATE_VOUT_DISABLE,
-  STWLC38_STATE_REPORT_READOUT,
-} stwlc38_fsm_state_t;
-
-typedef struct {
-  // Rectified voltage [mV]
-  uint16_t vrect;
-  // Main LDO voltage output [mV]
-  uint16_t vout;
-  // Output current [mA]
-  uint16_t icur;
-  // Chip temperature [°C * 10]
-  uint16_t tmeas;
-  // Operating frequency [kHz]
-  uint16_t opfreq;
-  // NTC Temperature [°C * 10]
-  uint16_t ntc;
-  // RX Int Status 0
-  uint8_t status0;
-
-} stwlc38_report_regs_t;
-
-// STWLC38 driver state
-typedef struct {
-  // Set if the driver is initialized
-  bool initialized;
-
-  // I2C bus where the STWLC38 is connected
-  i2c_bus_t* i2c_bus;
-  // Storage for the pending I2C packet
-  i2c_packet_t pending_i2c_packet;
-  // Report register (global buffer used for report readout)
-  stwlc38_report_regs_t report_regs;
-  // Timer used for periodic report readout
-  systimer_t* timer;
-
-  // Main LDO output current state
-  bool vout_enabled;
-  // Main LDO output requested state
-  bool vout_enabled_requested;
-  // Flags set if report readout is scheduled
-  bool report_readout_requested;
-
-  // Current report
-  stwlc38_report_t report;
-  // Current state of the FSM
-  stwlc38_fsm_state_t state;
-
-} stwlc38_driver_t;
-
 // STWLC38 driver instance
-static stwlc38_driver_t g_stwlc38_driver = {
+stwlc38_driver_t g_stwlc38_driver = {
     .initialized = false,
 };
 
+// I2C operation for writing 8-bit constant value to the STWLC38 register
+#define STWLC_WRITE_CONST8(reg, value)                                 \
+  {                                                                    \
+    .flags = I2C_FLAG_TX | I2C_FLAG_EMBED | I2C_FLAG_START, .size = 3, \
+    .data = {(reg) >> 8, (reg) & 0xFF, (value)},                       \
+  }
+
+// I2C operations for reading 16-bit STWLC38 register into the
+// specified field in `g_stwlc38_driver` structure
+#define STWLC_READ_FIELD16(reg, field)                               \
+  {                                                                  \
+      .flags = I2C_FLAG_TX | I2C_FLAG_EMBED | I2C_FLAG_START,        \
+      .size = 2,                                                     \
+      .data = {(reg) >> 8, (reg) & 0xFF},                            \
+  },                                                                 \
+  {                                                                  \
+    .flags = I2C_FLAG_RX, .size = 2, .ptr = &g_stwlc38_driver.field, \
+  }
+
+// I2C operations for reading 8-bit STWLC38 register into the
+// specified field in `g_stwlc38_driver` structure
+#define STWLC_READ_FIELD8(reg, field)                                \
+  {                                                                  \
+      .flags = I2C_FLAG_TX | I2C_FLAG_EMBED | I2C_FLAG_START,        \
+      .size = 2,                                                     \
+      .data = {(reg) >> 8, (reg) & 0xFF},                            \
+  },                                                                 \
+  {                                                                  \
+    .flags = I2C_FLAG_RX, .size = 1, .ptr = &g_stwlc38_driver.field, \
+  }
+
 // forward declarations
-static void stwlc38_timer_callback(void* context);
-static void stwlc38_i2c_callback(void* context, i2c_packet_t* packet);
-static void stwlc38_fsm_continue(stwlc38_driver_t* drv);
+static void stwlc38_timer_callback(void *context);
+static void stwlc38_i2c_callback(void *context, i2c_packet_t *packet);
+static void stwlc38_fsm_continue(stwlc38_driver_t *drv);
 
 void stwlc38_deinit(void) {
-  stwlc38_driver_t* drv = &g_stwlc38_driver;
+  stwlc38_driver_t *drv = &g_stwlc38_driver;
 
   i2c_bus_close(drv->i2c_bus);
   systimer_delete(drv->timer);
@@ -118,7 +81,7 @@ void stwlc38_deinit(void) {
 }
 
 bool stwlc38_init(void) {
-  stwlc38_driver_t* drv = &g_stwlc38_driver;
+  stwlc38_driver_t *drv = &g_stwlc38_driver;
 
   if (drv->initialized) {
     return true;
@@ -190,7 +153,7 @@ cleanup:
 }
 
 bool stwlc38_enable(bool enable) {
-  stwlc38_driver_t* drv = &g_stwlc38_driver;
+  stwlc38_driver_t *drv = &g_stwlc38_driver;
 
   if (!drv->initialized) {
     return false;
@@ -206,7 +169,7 @@ bool stwlc38_enable(bool enable) {
 }
 
 bool stwlc38_enable_vout(bool enable) {
-  stwlc38_driver_t* drv = &g_stwlc38_driver;
+  stwlc38_driver_t *drv = &g_stwlc38_driver;
 
   if (!drv->initialized) {
     return false;
@@ -223,37 +186,6 @@ bool stwlc38_enable_vout(bool enable) {
 
   return true;
 }
-
-// I2C operation for writing 8-bit constant value to the STWLC38 register
-#define STWLC_WRITE_CONST8(reg, value)                                 \
-  {                                                                    \
-    .flags = I2C_FLAG_TX | I2C_FLAG_EMBED | I2C_FLAG_START, .size = 3, \
-    .data = {(reg) >> 8, (reg) & 0xFF, (value)},                       \
-  }
-
-// I2C operations for reading 16-bit STWLC38 register into the
-// specified field in `g_stwlc38_driver` structure
-#define STWLC_READ_FIELD16(reg, field)                               \
-  {                                                                  \
-      .flags = I2C_FLAG_TX | I2C_FLAG_EMBED | I2C_FLAG_START,        \
-      .size = 2,                                                     \
-      .data = {(reg) >> 8, (reg) & 0xFF},                            \
-  },                                                                 \
-  {                                                                  \
-    .flags = I2C_FLAG_RX, .size = 2, .ptr = &g_stwlc38_driver.field, \
-  }
-
-// I2C operations for reading 8-bit STWLC38 register into the
-// specified field in `g_stwlc38_driver` structure
-#define STWLC_READ_FIELD8(reg, field)                                \
-  {                                                                  \
-      .flags = I2C_FLAG_TX | I2C_FLAG_EMBED | I2C_FLAG_START,        \
-      .size = 2,                                                     \
-      .data = {(reg) >> 8, (reg) & 0xFF},                            \
-  },                                                                 \
-  {                                                                  \
-    .flags = I2C_FLAG_RX, .size = 1, .ptr = &g_stwlc38_driver.field, \
-  }
 
 // I2C operations for readout of the current state into the
 // `g_stwlc38.state` structure
@@ -281,28 +213,27 @@ static const i2c_op_t stwlc38_ops_vout_disable[] = {
   _stwlc38_i2c_submit(drv, ops, ARRAY_LENGTH(ops))
 
 // helper function for submitting I2C operations
-static void _stwlc38_i2c_submit(stwlc38_driver_t* drv, const i2c_op_t* ops,
+static void _stwlc38_i2c_submit(stwlc38_driver_t *drv, const i2c_op_t *ops,
                                 size_t op_count) {
-  i2c_packet_t* pkt = &drv->pending_i2c_packet;
+  i2c_packet_t *pkt = &drv->pending_i2c_packet;
 
   memset(pkt, 0, sizeof(i2c_packet_t));
   pkt->address = STWLC38_I2C_ADDRESS;
   pkt->context = drv;
   pkt->callback = stwlc38_i2c_callback;
   pkt->timeout = 0;
-  pkt->ops = (i2c_op_t*)ops;
+  pkt->ops = (i2c_op_t *)ops;
   pkt->op_count = op_count;
 
   i2c_status_t status = i2c_bus_submit(drv->i2c_bus, pkt);
-
   if (status != I2C_STATUS_OK) {
     // This should never happen
-    error_shutdown("STWLC38 I2C submit error");
+    error_shutdown("STWLC32 I2C submit error");
   }
 }
 
-bool stwlc38_get_report(stwlc38_report_t* report) {
-  stwlc38_driver_t* drv = &g_stwlc38_driver;
+bool stwlc38_get_report(stwlc38_report_t *report) {
+  stwlc38_driver_t *drv = &g_stwlc38_driver;
 
   if (!drv->initialized) {
     return false;
@@ -315,16 +246,16 @@ bool stwlc38_get_report(stwlc38_report_t* report) {
   return true;
 }
 
-static void stwlc38_timer_callback(void* context) {
-  stwlc38_driver_t* drv = (stwlc38_driver_t*)context;
+static void stwlc38_timer_callback(void *context) {
+  stwlc38_driver_t *drv = (stwlc38_driver_t *)context;
 
   // Schedule the report readout
   drv->report_readout_requested = true;
   stwlc38_fsm_continue(drv);
 }
 
-static void stwlc38_i2c_callback(void* context, i2c_packet_t* packet) {
-  stwlc38_driver_t* drv = (stwlc38_driver_t*)context;
+static void stwlc38_i2c_callback(void *context, i2c_packet_t *packet) {
+  stwlc38_driver_t *drv = (stwlc38_driver_t *)context;
 
   if (packet->status != I2C_STATUS_OK) {
     memset(&drv->report, 0, sizeof(stwlc38_report_t));
@@ -384,7 +315,7 @@ static void stwlc38_i2c_callback(void* context, i2c_packet_t* packet) {
 }
 
 void STWLC38_EXTI_INTERRUPT_HANDLER(void) {
-  stwlc38_driver_t* drv = &g_stwlc38_driver;
+  stwlc38_driver_t *drv = &g_stwlc38_driver;
 
   // Clear the EXTI line pending bit
   __HAL_GPIO_EXTI_CLEAR_FLAG(STWLC38_INT_PIN);
@@ -397,7 +328,7 @@ void STWLC38_EXTI_INTERRUPT_HANDLER(void) {
   }
 }
 
-static void stwlc38_fsm_continue(stwlc38_driver_t* drv) {
+static void stwlc38_fsm_continue(stwlc38_driver_t *drv) {
   // The order of the following conditions defines the priority
 
   if (drv->state == STWLC38_STATE_POWER_DOWN && drv->report_readout_requested) {
